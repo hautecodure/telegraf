@@ -6,6 +6,7 @@ import (
 	_ "embed"
 	"fmt"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -17,6 +18,7 @@ import (
 	_ "github.com/microsoft/go-mssqldb/integratedauth/krb5" // integrated auth for mssql
 	_ "github.com/snowflakedb/gosnowflake"                  // snowflake
 
+	"github.com/cespare/xxhash/v2"
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/config"
 	"github.com/influxdata/telegraf/plugins/outputs"
@@ -55,6 +57,7 @@ type SQL struct {
 	TableExistsTemplate   string          `toml:"table_exists_template"`
 	TableUpdateTemplate   string          `toml:"table_update_template"`
 	InitSQL               string          `toml:"init_sql"`
+	PrepareWriteTx        bool            `toml:"prepare_write_tx"`
 	Convert               ConvertStruct   `toml:"convert"`
 	ConnectionMaxIdleTime config.Duration `toml:"connection_max_idle_time"`
 	ConnectionMaxLifetime config.Duration `toml:"connection_max_lifetime"`
@@ -63,6 +66,7 @@ type SQL struct {
 	Log                   telegraf.Logger `toml:"-"`
 
 	db                       *gosql.DB
+	queryCache               map[uint64]string
 	tables                   map[string]map[string]bool
 	tableListColumnsTemplate string
 }
@@ -134,6 +138,7 @@ func (p *SQL) Connect() error {
 
 	p.db = db
 	p.tables = make(map[string]map[string]bool)
+	p.queryCache = make(map[uint64]string)
 
 	return nil
 }
@@ -333,8 +338,109 @@ func (p *SQL) updateTableCache(tablename string) error {
 	return nil
 }
 
+func (p *SQL) processMetric(m telegraf.Metric) (uint64, []string, []interface{}) {
+	// Prepare the hash
+	h := xxhash.New()
+	h.Write([]byte(m.Name()))
+
+	elCount := len(m.TagList()) + len(m.FieldList())
+	if p.TimestampColumn != "" {
+		elCount++
+	}
+
+	columns := make([]string, 0, elCount)
+	if p.TimestampColumn != "" {
+		columns = append(columns, p.TimestampColumn)
+	}
+
+	// Prepare the parameters
+	params := make([]interface{}, 0, elCount)
+	if p.TimestampColumn != "" {
+		params = append(params, m.Time())
+	}
+
+	// Tags are already sorted but fields need to be sorted to end-up in the right spot
+	fields := make([]*telegraf.Field, len(m.FieldList()))
+	copy(fields, m.FieldList())
+	slices.SortFunc(fields, func(a, b *telegraf.Field) int { return strings.Compare(a.Key, b.Key) })
+
+	// Add the data to both the parameters and hash
+	for _, tag := range m.TagList() {
+		h.Write([]byte(tag.Key))
+		columns = append(columns, tag.Key)
+		params = append(params, tag.Value)
+	}
+	for _, field := range fields {
+		h.Write([]byte(field.Key))
+		columns = append(columns, field.Key)
+		params = append(params, field.Value)
+	}
+
+	return h.Sum64(), columns, params
+}
+
+func (p *SQL) sendUnprepared(sql string, values []interface{}) error {
+	switch p.Driver {
+	case "clickhouse":
+		// ClickHouse needs to batch inserts with prepared statements
+		tx, err := p.db.Begin()
+		if err != nil {
+			return fmt.Errorf("begin failed: %w", err)
+		}
+		stmt, err := tx.Prepare(sql)
+		if err != nil {
+			return fmt.Errorf("prepare failed: %w", err)
+		}
+		defer stmt.Close() //nolint:revive,gocritic // done on purpose, closing will be executed properly
+
+		_, err = stmt.Exec(values...)
+		if err != nil {
+			return fmt.Errorf("execution failed: %w", err)
+		}
+		err = tx.Commit()
+		if err != nil {
+			return fmt.Errorf("commit failed: %w", err)
+		}
+	default:
+		_, err := p.db.Exec(sql, values...)
+		if err != nil {
+			return fmt.Errorf("execution failed: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func (p *SQL) sendPrepared(sql string, sliceParams [][]interface{}) error {
+	tx, err := p.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin failed: %w", err)
+	}
+
+	batch, err := tx.Prepare(sql)
+	if err != nil {
+		return fmt.Errorf("prepare failed: %w", err)
+	}
+	defer batch.Close()
+
+	for _, params := range sliceParams {
+		if _, err := batch.Exec(params...); err != nil {
+			if errRollback := tx.Rollback(); errRollback != nil {
+				return fmt.Errorf("execution failed: %w, unable to rollback: %w", err, errRollback)
+			}
+			return fmt.Errorf("execution failed: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("tx commit failed: %w", err)
+	}
+
+	return nil
+}
+
 func (p *SQL) Write(metrics []telegraf.Metric) error {
-	var err error
+	batchedQueries := make(map[string][][]interface{})
 
 	for _, metric := range metrics {
 		tablename := metric.Name()
@@ -346,63 +452,40 @@ func (p *SQL) Write(metrics []telegraf.Metric) error {
 			}
 		}
 
-		var columns []string
-		var values []interface{}
-
-		if p.TimestampColumn != "" {
-			columns = append(columns, p.TimestampColumn)
-			values = append(values, metric.Time())
-		}
-
-		for column, value := range metric.Tags() {
-			columns = append(columns, column)
-			values = append(values, value)
-		}
-
-		for column, value := range metric.Fields() {
-			columns = append(columns, column)
-			values = append(values, value)
+		hash, columns, params := p.processMetric(metric)
+		if p.queryCache[hash] == "" {
+			p.queryCache[hash] = p.generateInsert(tablename, columns)
 		}
 
 		// Modifying the table schema is opt-in
 		if p.TableUpdateTemplate != "" {
 			for i := range len(columns) {
-				if err := p.createColumn(tablename, columns[i], p.deriveDatatype(values[i])); err != nil {
+				if err := p.createColumn(tablename, columns[i], p.deriveDatatype(params[i])); err != nil {
 					return err
 				}
 			}
 		}
 
-		sql := p.generateInsert(tablename, columns)
-
-		switch p.Driver {
-		case "clickhouse":
-			// ClickHouse needs to batch inserts with prepared statements
-			tx, err := p.db.Begin()
-			if err != nil {
-				return fmt.Errorf("begin failed: %w", err)
-			}
-			stmt, err := tx.Prepare(sql)
-			if err != nil {
-				return fmt.Errorf("prepare failed: %w", err)
-			}
-			defer stmt.Close() //nolint:revive,gocritic // done on purpose, closing will be executed properly
-
-			_, err = stmt.Exec(values...)
-			if err != nil {
-				return fmt.Errorf("execution failed: %w", err)
-			}
-			err = tx.Commit()
-			if err != nil {
-				return fmt.Errorf("commit failed: %w", err)
-			}
-		default:
-			_, err = p.db.Exec(sql, values...)
-			if err != nil {
-				return fmt.Errorf("execution failed: %w", err)
+		// Using Prepared Tx is opt-in
+		if p.PrepareWriteTx {
+			sql := p.queryCache[hash]
+			batchedQueries[sql] = append(batchedQueries[sql], params)
+		} else {
+			sql := p.generateInsert(tablename, columns)
+			if err := p.sendUnprepared(sql, params); err != nil {
+				return err
 			}
 		}
 	}
+
+	if p.PrepareWriteTx {
+		for sql, sqlParams := range batchedQueries {
+			if err := p.sendPrepared(sql, sqlParams); err != nil {
+				return fmt.Errorf("failed to send a batched tx: %w", err)
+			}
+		}
+	}
+
 	return nil
 }
 
